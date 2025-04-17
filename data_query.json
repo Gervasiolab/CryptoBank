@@ -1,0 +1,105 @@
+{
+  rcsb_id
+  rcsb_entry_info {
+    polymer_composition
+    resolution_combined
+    branched_entity_count
+    nonpolymer_entity_count
+    polymer_entity_count
+    branched_entity_count
+  }
+  polymer_entities {
+    entity_poly {
+      pdbx_strand_id
+      pdbx_target_identifier
+      pdbx_seq_one_letter_code
+      pdbx_sequence_evidence_code
+      pdbx_seq_one_letter_code_can
+      rcsb_sample_sequence_length
+    }
+    rcsb_cluster_membership {
+      cluster_id
+      identity
+    }
+    rcsb_polymer_entity_container_identifiers { 
+      auth_asym_ids
+      asym_ids
+      reference_sequence_identifiers {
+        database_name
+        database_accession
+      }
+    }
+    uniprots {
+      rcsb_uniprot_container_identifiers {
+        uniprot_id
+      }
+    }
+  }
+  rcsb_accession_info {
+    initial_release_date
+    revision_date
+  }  
+  rcsb_entry_container_identifiers {
+    branched_entity_ids
+    non_polymer_entity_ids
+  }
+  nonpolymer_entities {
+    nonpolymer_entity_instances{
+      rcsb_nonpolymer_entity_instance_container_identifiers{
+        auth_seq_id
+        auth_asym_id
+      }
+    }
+    pdbx_entity_nonpoly {
+      rcsb_prd_id
+      comp_id
+    }
+    rcsb_nonpolymer_entity {
+      pdbx_description
+      pdbx_number_of_molecules
+      details
+      formula_weight
+    }
+    rcsb_nonpolymer_entity_container_identifiers {
+      nonpolymer_comp_id
+      auth_asym_ids
+    }
+    nonpolymer_comp {
+      rcsb_chem_comp_container_identifiers {
+        drugbank_id
+        prd_id
+        rcsb_id
+      }
+      rcsb_chem_comp_target {
+        interaction_type
+        name
+        provenance_source
+        reference_database_accession_code
+        reference_database_name
+      }
+      rcsb_schema_container_identifiers {
+        collection_schema_version
+      }
+      chem_comp {
+        id
+        type
+        formula_weight
+        name
+      }
+      rcsb_chem_comp_descriptor {
+        InChI
+      }
+      pdbx_chem_comp_descriptor {
+        descriptor
+        type
+        program
+      }
+    }
+  }
+  refine {
+    ls_R_factor_R_free
+    ls_R_factor_R_work
+    ls_R_factor_obs
+    ls_d_res_high
+  }
+}
