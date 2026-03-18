@@ -1,12 +1,26 @@
 import pymol.cmd as cmd
 import pandas as pd
 import numpy as np
-from scipy.spatial.distance import euclidean
 import pickle
 import os
 from joblib import Parallel, delayed
 from sklearn.cluster import AgglomerativeClustering
-from collections import defaultdict
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_repo_relative_path(path):
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(SCRIPT_DIR, path))
+
+
+def ensure_dir(directory):
+    os.makedirs(directory, exist_ok=True)
+
+
+FETCH_PATH = resolve_repo_relative_path(os.environ.get("FETCH_PATH", "../../pdb/cif_files"))
 
 def compute_center_of_geometry(selection):
     """
@@ -88,9 +102,7 @@ def get_sites_holo(clusterNumber):
     to_test_subset['site_coords'] = None
     to_test_subset.reset_index(drop=True, inplace=True)
     
-    # Process structures in batches for alignment and site coordinate calculation
     fetch_list_original = list(set(to_test_subset["structureId"].tolist()))
-    #fetch_list_original = list(set([elem.upper() for elem in to_test_subset["structureId"].tolist()]))
     if not fetch_list_original:
         return to_test_subset
     print("Primary structure in cluster:", fetch_list_original[0])
@@ -99,9 +111,9 @@ def get_sites_holo(clusterNumber):
         print("Processing batch starting at index:", i)
         cmd.reinitialize()
         cmd.feedback("disable", "all", "output")
-        cmd.set('fetch_path', '../cif_files')
+        ensure_dir(FETCH_PATH)
+        cmd.set('fetch_path', cmd.exp_path(FETCH_PATH), quiet=2)
 
-        # Use the first structure in the list as the reference
         batch = fetch_list_original[i+1:i+1+50]
         try:
             cmd.fetch(fetch_list_original[0])
@@ -120,15 +132,11 @@ def get_sites_holo(clusterNumber):
         temp_list = []
 
 
-        # Group elements by their lowercase value
         batch_and_original = batch + [fetch_list_original[0]]
         duplicates = [x for x in batch_and_original if sum(y.lower() == x.lower() for y in batch_and_original) > 1]
-        #duplicates = duplicates but with everything after the first underscore in lowercase
         low_repeated = list(set([x.split('_')[0] + '_' + x.split('_')[1].lower() for x in duplicates]) )
         print(low_repeated)
-        #get a list of elements in batch that have the same with a different case
         for elem in batch:
-            #if elem is not the same as fetch_list_original[0] in any case, fetch it
             if elem not in low_repeated:
                 try:
                     cmd.fetch(elem, quiet=2)
@@ -141,7 +149,6 @@ def get_sites_holo(clusterNumber):
                 cmd.create(f'{elem}_temp', f'{elem}_temp')
                 cmd.delete(elem.split('_')[0])
                 temp_list.append(elem)
-            #print("Fetched and modified:", elem, "and", fetch_list_original[0])
 
         for elem in batch:
             try:
@@ -152,7 +159,6 @@ def get_sites_holo(clusterNumber):
             except Exception as e:
                 print("Problem aligning structure", elem, "with", fetch_list_original[0], ":", e)
 
-        # Process the current batch: compute center of geometry for each ligand
         batch_df = to_test_subset[to_test_subset['structureId'].isin([fetch_list_original[0]] + batch)]
         for index, row in batch_df.iterrows():
             try:
@@ -167,12 +173,10 @@ def get_sites_holo(clusterNumber):
             except Exception as e:
                 print('Error processing structureId:', row['structureId'], 'resid:', row['resid'], ';', e)
 
-        # Convert the site_coords string into a list of floats when applicable
         to_test_subset['site_coords'] = to_test_subset['site_coords'].apply(
             lambda x: [float(i) for i in x.strip('][').split(', ')] if isinstance(x, str) else x
         )
     
-    # Use agglomerative clustering to assign ligand sites
     valid_df = to_test_subset[to_test_subset['site_coords'].apply(lambda x: isinstance(x, list))]
     if not valid_df.empty:
         coords_array = np.array(valid_df['site_coords'].tolist())
@@ -184,7 +188,6 @@ def get_sites_holo(clusterNumber):
         to_test_subset['new_site'] = None
         to_test_subset['site_centroid'] = None
 
-    # Record the primary reference structure
     to_test_subset["reference_structureId"] = fetch_list_original[0]
     
     try:
@@ -197,26 +200,20 @@ def get_sites_holo(clusterNumber):
         print(to_test_subset)
 
 if __name__ == '__main__':
-    # Load the main monomers dataframe
     monomers = pd.read_pickle('combined.p')
     monomers = monomers[monomers['resid'].notna()]
     unique_clusterNumbers = list(monomers.clusterNumber95.unique())
     
     print("Processing clusters in parallel...")
-    # Process each cluster in parallel
     results = Parallel(n_jobs=126)(
         delayed(get_sites_holo)(clusterNumber) for clusterNumber in unique_clusterNumbers
     )
-    #concatenate all results in the folder get_sites
-    #create all_sites_df with the columns Index(['structureId', 'resid', 'ligandId', 'site_coords', 'new_site','site_centroid', 'reference_structureId', 'clusterNumber95']
     dfs = []
     for file in os.listdir('./'):
         if file.startswith('sites_cluster_'):
             df = pd.read_pickle(os.path.join('./', file))
             dfs.append(df)
     all_sites_df = pd.concat(dfs, ignore_index=True)
-    # Concatenate all per-cluster dataframes into one
-    #all_sites_df = pd.concat(results, ignore_index=True)
 
     print("Concatenated all cluster dataframes.")
     
@@ -224,9 +221,3 @@ if __name__ == '__main__':
     print(all_sites_df.columns)
     print(monomers.columns)
     print("all_sites_df.p has been saved")
-    # Merge the sites information with the original combined data on structureId, resid, and ligandId
-    #merged = pd.merge(monomers, all_sites_df, on=["structureId", "resid", "ligandId"], how='left')
-   # print("Merged sites data with combined.p data.")
-    
-    # Save the merged dataframe to a new pickle file
-    #pickle.dump(merged, open('combined_with_sites.p', 'wb'))

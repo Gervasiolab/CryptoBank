@@ -1,7 +1,13 @@
+import os
 import MDAnalysis as mda
 from scipy.spatial import distance
 import numpy as np
 import pickle
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+THREE_SEGMENT_MODEL_PATH = os.path.join(SCRIPT_DIR, "3seg_distmodel_parameters.npy")
+ONE_SEGMENT_MODEL_PATH = os.path.join(SCRIPT_DIR, "weights1seg.pkl")
 
 def parse_xyz_file(xyz_filepath, apo, holo, lig_id, label):
     """
@@ -113,11 +119,6 @@ def split_ligand_into_segments(ligand, n_lig_splits, apo, holo, lig_id):
         segments = [np.arange(ligand_pos.shape[0])] + [np.array([], dtype=int)] * (n_lig_splits - 1)
         print(f"Ligand {lig_id} for apo {apo} and holo {holo} has all atoms collinear. All atoms assigned to first segment.")
         return segments
-
-    #if either ligand_pos.shape[0] < 2 or np.isclose(max_proj, min_proj) write the apo, holo and lig_id to a file
-    if ligand_pos.shape[0] < 2 or np.isclose(max_proj, min_proj):
-        with open("degenerate_ligands.txt", "a") as f:
-            f.write(f"{apo}, {holo}, {lig_id}\n")
 
     # Define equal sections along the projection range
     section_size = (max_proj - min_proj) / n_lig_splits
@@ -354,10 +355,7 @@ def model_predict(model_k, apo_matrices, holo_matrices, valid_segments, lig_spli
     lig_around_apo = 0
     lig_around_holo = 0
     for i in range(lig_splits):
-        # FUNNY NOTE: v = np.zeros([]) creates a scalar, whereas v = np.zeros((1,)) 
-        # creates a 1D array. NumPy treats them differently, leading to negligible 
-        # numerical differences when computing _sigmoid(v). LOL.
-        # v = np.zeros([])
+        # Keep the input as a 1D array to preserve a consistent shape for `_sigmoid`.
         v = np.zeros((1,))
 
         apo_start = i * int(2 * shells)
@@ -368,21 +366,17 @@ def model_predict(model_k, apo_matrices, holo_matrices, valid_segments, lig_spli
         if i in valid_segments:  # Example: [0,1,2] if all ligand segments contain atoms
             if apo_matrices[i].size != 0:
                 pot_apo, d_pot_apo = shell_potential(model_k[apo_start:apo_end], apo_matrices[i], shells, min_dist, max_dist)
-                #print("pot_apo for lig_id", i, "is", pot_apo)
                 energy_sys_apo = np.sum(pot_apo) / len(apo_matrices[i])
                 v += energy_sys_apo
                 lig_around_apo = 1
 
             if holo_matrices[i].size != 0:
-                #print("holo_matrices[i] for lig_id", i, "is", holo_matrices[i])
                 pot_holo, d_pot_holo = shell_potential(model_k[holo_start:holo_end], holo_matrices[i], shells, min_dist, max_dist)
-                #print("pot_holo for lig_id", i, "is", pot_holo)
                 energy_sys_holo = np.sum(pot_holo) / len(holo_matrices[i])
                 v += energy_sys_holo
                 lig_around_holo = 1
             v /= 2
         v_list.append(np.array(v))
-        #print("v for lig_id", i, "is", v)
         p_list.append(_sigmoid(v))
     eff_p_list = np.array([x / lig_splits for x in p_list])
     p = np.array([np.mean(p_list)])
@@ -423,7 +417,7 @@ n_shells = 4
 # Number of ligand segments (S) - Defines how many segments the ligand is divided into
 n_lig_splits = 3
 # Load the model weights (k) 
-weights = np.load('3seg_distmodel_parameters.npy')
+weights = np.load(THREE_SEGMENT_MODEL_PATH)
 
 #######################################################
 ###############    END PARAMETERS SECTION    #########
@@ -455,9 +449,10 @@ def get_score(xyz_apo, xyz_holo, apo_id, holo_id, lig_resid, n_lig_splits):
         - probabilities (list of np.ndarray): Raw probability values for each ligand section.
     """
     if n_lig_splits == 3:
-        weights = np.load('3seg_distmodel_parameters.npy')
+        weights = np.load(THREE_SEGMENT_MODEL_PATH)
     elif n_lig_splits == 1:
-        weights = pickle.load(open('weights1seg.pkl', 'rb'))
+        with open(ONE_SEGMENT_MODEL_PATH, 'rb') as handle:
+            weights = pickle.load(handle)
     else:
         raise ValueError(f"Invalid number of ligand splits: {n_lig_splits}")
     # Compute distance matrices for apo and holo structures

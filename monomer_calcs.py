@@ -18,12 +18,26 @@ from pymol import cmd
 from rcsbapi.search import search_attributes as attrs
 
 
-# Custom module imports (adjust these paths as needed)
 from scoring_function import *
 
 
 
-FETCH_PATH = '../../pdb/cif_files/'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_QUERY_PATH = os.path.join(SCRIPT_DIR, "data_query.json")
+EXCLUSION_LIST_DIR = os.path.join(SCRIPT_DIR, "exclusion_lists")
+
+
+def resolve_repo_relative_path(path: str) -> str:
+    """
+    Resolves a path relative to this repository file unless it is already absolute.
+    """
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(SCRIPT_DIR, path))
+
+
+FETCH_PATH = resolve_repo_relative_path(os.environ.get("FETCH_PATH", "../../pdb/cif_files"))
+ALPHAFOLD_DIR = resolve_repo_relative_path(os.environ.get("ALPHAFOLD_DIR", "../../pdb/alphafold"))
 # -----------------------------------------------------------------------------
 # GLOBAL PARAMETERS & DATA FOLDER SETUP
 # -----------------------------------------------------------------------------
@@ -49,6 +63,83 @@ def ensure_dir(directory: str) -> None:
         None
     """
     os.makedirs(directory, exist_ok=True)
+
+
+def load_structure_ids_from_pickle(filename: str, required: bool = True) -> List[str]:
+    """
+    Loads PDB identifiers from a pickle file in the current working directory.
+
+    Four-character identifiers are kept as-is. Six-character identifiers are
+    assumed to be `PDBID_CHAIN` entries and are reduced to the four-character
+    PDB code to match the download/query interface.
+    """
+    filepath = os.path.join(os.getcwd(), filename)
+    if not os.path.exists(filepath):
+        if required:
+            raise FileNotFoundError(f"Required input list not found: {filepath}")
+        return []
+
+    raw_ids = pd.read_pickle(filepath)
+    if isinstance(raw_ids, pd.Series):
+        ids = raw_ids.dropna().astype(str).tolist()
+    elif isinstance(raw_ids, pd.Index):
+        ids = raw_ids.dropna().astype(str).tolist()
+    elif isinstance(raw_ids, np.ndarray):
+        ids = pd.Series(raw_ids).dropna().astype(str).tolist()
+    elif isinstance(raw_ids, (list, tuple, set)):
+        ids = [str(value) for value in raw_ids if pd.notna(value)]
+    else:
+        ids = pd.Series(raw_ids).dropna().astype(str).tolist()
+
+    if not ids:
+        return []
+
+    id_lengths = {len(value) for value in ids}
+    if not id_lengths.issubset({4, 6}):
+        raise ValueError(f"{filename} should contain only 4- or 6-character identifiers")
+
+    normalized_ids = [value[:4] if len(value) == 6 else value for value in ids]
+    return sorted(set(normalized_ids))
+
+
+def get_alphafold_model_path(uniprot_id: str) -> Optional[str]:
+    """
+    Returns the local AlphaFold model path for a UniProt accession if available.
+
+    Always prefers the highest available local model version.
+    """
+    candidates = glob.glob(os.path.join(ALPHAFOLD_DIR, f"AF-{uniprot_id}-F1-model_v*.cif"))
+    if not candidates:
+        return None
+
+    def version_key(path: str) -> int:
+        basename = os.path.splitext(os.path.basename(path))[0]
+        try:
+            return int(basename.rsplit("model_v", 1)[1])
+        except (IndexError, ValueError):
+            return -1
+
+    return max(candidates, key=version_key)
+
+
+def get_alphafold_model_id(uniprot_id: str) -> Optional[str]:
+    """
+    Returns the AlphaFold structure identifier without file extension.
+    """
+    model_path = get_alphafold_model_path(uniprot_id)
+    if model_path is None:
+        return None
+    return os.path.splitext(os.path.basename(model_path))[0]
+
+
+def get_alphafold_structure_path(model_id: str) -> str:
+    """
+    Resolves the local AlphaFold file path for a known model identifier.
+    """
+    model_path = os.path.join(ALPHAFOLD_DIR, f"{model_id}.cif")
+    if os.path.exists(model_path):
+        return model_path
+    raise FileNotFoundError(f"AlphaFold model not found: {model_path}")
 
 def warn(*args, **kwargs):
     """
@@ -297,7 +388,7 @@ def get_data_2(pdb_list: List[str], apos: bool) -> Optional[pd.DataFrame]:
                               None if the fetch operation fails
     """
     pdbs_str = '","'.join(pdb_list)
-    with open("./data_query.json", "r") as json_file:
+    with open(DATA_QUERY_PATH, "r") as json_file:
         json_as_str = json_file.read().replace(" ", "")
     json_as_str = json_as_str.replace("{\n", "{").replace("\n}", "}").replace("\n", ",")[:-1]
     url_stem = 'https://data.rcsb.org/graphql?'
@@ -366,37 +457,38 @@ def download_data(input_list: bool, max_res: float = 2.5, update_previous: bool 
         if not input_list:
             holo_ids, apo_ids = get_ids(max_res)
         else:
-            holo_ids = pd.read_pickle("holo_list.p")
-            #apo_ids = pd.read_pickle("apo_list.p")
-            #holo_ids = ["2HS1", "6IXD"]
-            apo_ids = ["3DVD", "3DJK"]
-            #holo_ids = holo_ids + apo_ids
-            #holo_ids = list(set(holo_ids))
-            #apo_ids = ["3DVD", "6SF4"]
-            print(holo_ids)
-            if len(holo_ids[0]) == 4:
-                pass
-            elif len(holo_ids[0]) == 6:
-                holo_ids = [id[:4] for id in holo_ids]
-                holo_ids = list(set(holo_ids))
-            else:
-                raise ValueError("Holo ids should be 4 or 6 characters long")
+            holo_ids = load_structure_ids_from_pickle("holo_list.p", required=True)
+            apo_ids = load_structure_ids_from_pickle("apo_list.p", required=False)
+            if not apo_ids:
+                print("No apo_list.p found; using apo candidates derived from filtered holos and local AlphaFold models.")
+        if not holo_ids:
+            raise ValueError("No holo IDs were provided")
         n = 1000
         holo_chunks = [holo_ids[i * n:(i + 1) * n] for i in range((len(holo_ids) + n - 1) // n)]
         apo_chunks = [apo_ids[i * n:(i + 1) * n] for i in range((len(apo_ids) + n - 1) // n)]
         print('  Starting downloading data for holos')
         output_2 = Parallel(n_jobs=16)(delayed(get_data_2)(chunk, False) for chunk in holo_chunks)
         df_list_2 = [df for df in output_2 if df is not None]
+        if not df_list_2:
+            raise ValueError("No holo metadata could be retrieved for the selected IDs")
         holo_2 = pd.concat(df_list_2, ignore_index=True)
         ensure_dir(os.path.join(DATA_ROOT, "monomer_calcs"))
         pickle.dump(holo_2, open(holo_path, "wb"))
-        print('  Starting downloading data for apos')
-        output_2 = Parallel(n_jobs=16)(delayed(get_data_2)(chunk, True) for chunk in apo_chunks)
-        df_list_2 = [df for df in output_2 if df is not None]
-        apo_2 = pd.concat(df_list_2, ignore_index=True)
+        if apo_chunks:
+            print('  Starting downloading data for apos')
+            output_2 = Parallel(n_jobs=16)(delayed(get_data_2)(chunk, True) for chunk in apo_chunks)
+            df_list_2 = [df for df in output_2 if df is not None]
+            if df_list_2:
+                apo_2 = pd.concat(df_list_2, ignore_index=True)
+            else:
+                apo_2 = holo_2.iloc[0:0].copy()
+        else:
+            apo_2 = holo_2.iloc[0:0].copy()
         pickle.dump(apo_2, open(apo_path, "wb"))
     combined_df = exlude_not_ligands(holo_2, apo_2)
-    combined_path = os.path.join(os.path.dirname(combined_df.iloc[0]['rcsb_id']), DATA_ROOT, "monomer_calcs")
+    if combined_df.empty:
+        raise ValueError("No holo/apo pairs were identified for the selected input set")
+    combined_path = os.path.join(DATA_ROOT, "monomer_calcs")
     ensure_dir(combined_path)
     combined_df = optimize_dataframe(combined_df)
     combined_reconstructed = pd.DataFrame(combined_df.values, columns=combined_df.columns)
@@ -451,6 +543,34 @@ def get_asym(row, apo: bool = False):
         # If the chain is not found in auth_asym_ids
         return None
 
+
+def add_af_apo_rows(all_apos: pd.DataFrame,
+                    holos_definitive: pd.DataFrame,
+                    alphafold_models: Dict[str, str]) -> pd.DataFrame:
+    """
+    Appends AlphaFold apo rows keyed by UniProt accession.
+
+    The new rows only need the AlphaFold structure identifier, the UniProt ID,
+    and the holo cluster mapping. All other fields are left as NaN and are
+    aligned to the existing apo dataframe columns.
+    """
+    if not alphafold_models:
+        return all_apos
+
+    cluster_map = (
+        holos_definitive
+        .drop_duplicates(subset="uniprot_id")
+        .set_index("uniprot_id")["cluster_id_95"]
+    )
+
+    new_rows = pd.DataFrame({
+        "holo_and_chain_apo": list(alphafold_models.values()),
+        "uniprot_id_apo": list(alphafold_models.keys()),
+        "cluster_id_95_apo": [cluster_map.get(uniprot_id) for uniprot_id in alphafold_models],
+    })
+    new_rows = new_rows.reindex(columns=all_apos.columns)
+    return pd.concat([all_apos, new_rows], ignore_index=True)
+
 # -----------------------------------------------------------------------------
 # LIGAND EXCLUSION FUNCTION
 # -----------------------------------------------------------------------------
@@ -468,10 +588,10 @@ def exlude_not_ligands(holos: pd.DataFrame, apos: pd.DataFrame) -> pd.DataFrame:
     Note:
         Uses predefined exclusion lists for elements, ions, low mass ligands, and solvents
     """
-    elements_df = pd.read_csv('./exclusion_lists/elements.csv', sep="|").replace(np.nan, "NA")
-    ions_df = pd.read_csv('./exclusion_lists/ions_curated.csv', sep="|").replace(np.nan, "NA")
-    low_mass_df = pd.read_csv('./exclusion_lists/low_mass_ligands_curated.csv', sep="|").replace(np.nan, "NA")
-    solvents_df = pd.read_csv('./exclusion_lists/solvents.csv', sep="|").replace(np.nan, "NA")
+    elements_df = pd.read_csv(os.path.join(EXCLUSION_LIST_DIR, 'elements.csv'), sep="|").replace(np.nan, "NA")
+    ions_df = pd.read_csv(os.path.join(EXCLUSION_LIST_DIR, 'ions_curated.csv'), sep="|").replace(np.nan, "NA")
+    low_mass_df = pd.read_csv(os.path.join(EXCLUSION_LIST_DIR, 'low_mass_ligands_curated.csv'), sep="|").replace(np.nan, "NA")
+    solvents_df = pd.read_csv(os.path.join(EXCLUSION_LIST_DIR, 'solvents.csv'), sep="|").replace(np.nan, "NA")
     exclusion_list = pd.concat([elements_df, ions_df, low_mass_df, solvents_df], ignore_index=True)
     exclusion_list = exclusion_list.drop(columns=["ligandName", "ligandSmiles", "ligandMolecularWeight"])
     holos_na = holos[holos["ligand_id"].isna()].copy()
@@ -511,6 +631,16 @@ def exlude_not_ligands(holos: pd.DataFrame, apos: pd.DataFrame) -> pd.DataFrame:
     holos_definitive = holos_definitive[holos_definitive["cluster_id_95"].notna()]
     holos_definitive = holos_definitive[holos_definitive["uniprot_id"].notna()]
     holos_definitive["cluster_id_95"] = holos_definitive["cluster_id_95"].astype(int)
+
+    alphafold_models = {}
+    for uniprot_id in holos_definitive["uniprot_id"].dropna().unique():
+        model_id = get_alphafold_model_id(uniprot_id)
+        if model_id is not None:
+            alphafold_models[uniprot_id] = model_id
+    if alphafold_models:
+        print(f"Adding {len(alphafold_models)} AlphaFold apo models")
+        all_apos = add_af_apo_rows(all_apos, holos_definitive, alphafold_models)
+
     all_apos = all_apos[all_apos["cluster_id_95_apo"].notna()]
     all_apos = all_apos[all_apos["uniprot_id_apo"].notna()]
     intersection_holos_apos = holos_definitive[holos_definitive["cluster_id_95"].isin(all_apos["cluster_id_95_apo"])]
@@ -541,7 +671,8 @@ def exlude_not_ligands(holos: pd.DataFrame, apos: pd.DataFrame) -> pd.DataFrame:
                 'alt_removed_apo','ligand_contacts', "holo_full_seq", "apo_full_seq", "holo_lig_seq", "apo_lig_seq",
                 'linear_score_1', 'linear_score_local_1', 'lig_around_apo_1', 'lig_around_holo_1',
                 'lig_around_apo_3', 'lig_around_holo_3', 'lig_around_apo_local_1',
-                'lig_around_holo_local_1', 'lig_around_apo_local_3', 'lig_around_holo_local_3']:
+                'lig_around_holo_local_1', 'lig_around_apo_local_3', 'lig_around_holo_local_3',
+                'alphafold']:
         combined_df[col] = np.nan
     combined_df = combined_df.drop(columns=['resid_apo'])
     combined_df = combined_df.drop_duplicates(keep='first')
@@ -670,6 +801,7 @@ def analyze_ligand_contacts(pdb_id, ligand_info):
     official_chain = pdb_id.split("_")[1]
     cmd.reinitialize()
     cmd.feedback("disable", "all", "output")
+    ensure_dir(FETCH_PATH)
     cmd.set('fetch_path', cmd.exp_path(FETCH_PATH), quiet=2)
     cmd.fetch(main_pdb)
     cmd.remove("sol")
@@ -716,6 +848,7 @@ def pymol_monomer_processing(apo_list: List[str], structureId: str, ligs: List[s
     ligand_contacts = analyze_ligand_contacts(structureId, ligand_info)
     cmd.feedback("disable", "all", "output")
     cmd.reinitialize()
+    ensure_dir(FETCH_PATH)
     cmd.set('fetch_path', cmd.exp_path(FETCH_PATH), quiet=2)
     pymolspace = {}
     cmd.fetch(structureId, discrete=1)
@@ -741,25 +874,33 @@ def pymol_monomer_processing(apo_list: List[str], structureId: str, ligs: List[s
     cmd.save(session_path)
     holo_apo_score = []
     for apo in apo_list:
-        apo_backup = apo
+        apo_result_id = apo
         cmd.reinitialize()
+        ensure_dir(FETCH_PATH)
         cmd.set('fetch_path', cmd.exp_path(FETCH_PATH), quiet=2)
         cmd.load(session_path)
-        try:
-            cmd.fetch(apo, discrete=1)
-        except Exception as err:
-            print(err)
-            print(f"Error fetching apo: trying again with full object {apo}")
-            cmd.fetch(apo[:4], discrete=1)
-            cmd.select(f"{apo}_temp", f"{apo[:4]} and chain {apo.split('_')[1]}")
-            cmd.create(f'{apo}_temp', f'{apo}_temp')
-            cmd.delete(apo[:4])
-            apo_backup = apo
-            apo = f"{apo}_temp"
+        if apo.startswith("AF-"):
+            alphafold = True
+            apo_path = get_alphafold_structure_path(apo)
+            apo_object = f"a_{apo.replace('-', '_')}"
+            cmd.load(apo_path, apo_object)
+        else:
+            alphafold = False
+            apo_object = apo
+            try:
+                cmd.fetch(apo, discrete=1)
+            except Exception as err:
+                print(err)
+                print(f"Error fetching apo: trying again with full object {apo}")
+                cmd.fetch(apo[:4], discrete=1)
+                apo_object = f"{apo}_temp"
+                cmd.select(apo_object, f"{apo[:4]} and chain {apo.split('_')[1]}")
+                cmd.create(apo_object, apo_object)
+                cmd.delete(apo[:4])
         cmd.remove('sol')
-        alt_removed_apo = remove_alternate_locations(apo)
-        RMSD_name = f'RMSD_{structureId}__{apo}'
-        apo_selection  = f'{apo} & n. CA & polymer'
+        alt_removed_apo = remove_alternate_locations(apo_object)
+        RMSD_name = f'RMSD_{structureId}__{apo_object}'
+        apo_selection  = f'{apo_object} & n. CA & polymer'
         holo_selection = f'{structureId} & n. CA & polymer'
         for row in ligand_info:
             pymolspace[RMSD_name] = cmd.align(apo_selection, holo_selection)
@@ -768,11 +909,11 @@ def pymol_monomer_processing(apo_list: List[str], structureId: str, ligs: List[s
             lig_key = f"{lig}_{resid}"
             ligand_sel = f"{structureId} and resn {lig} and resi {resid}"
             holo_full_seq, holo_lig_seq = extract_binding_site_sequence(structureId, ligand_sel, distance=4.0)
-            apo_full_seq, apo_lig_seq = extract_binding_site_sequence(apo, ligand_sel, distance=4.0)
+            apo_full_seq, apo_lig_seq = extract_binding_site_sequence(apo_object, ligand_sel, distance=4.0)
             if ligand_contacts[lig_key][structureId.split('_')[1]] == 0:
                 result = {
                     'structureId': structureId,
-                    'structureId_apo': apo_backup,
+                    'structureId_apo': apo_result_id,
                     'ligandId': lig, 
                     'resid': resid,
                     'linear_score_3': -1,
@@ -801,17 +942,19 @@ def pymol_monomer_processing(apo_list: List[str], structureId: str, ligs: List[s
                     'lig_around_apo_local_1': -3,
                     'lig_around_holo_local_1': -3,
                     'lig_around_apo_local_3': -3,
-                    'lig_around_holo_local_3': -3
+                    'lig_around_holo_local_3': -3,
+                    'alphafold': alphafold
                 }
                 holo_apo_score.append(result)
                 continue
             min_rmsd = 1000
             best_cutoff = 10
             holo_lig = f'holo_{structureId}_{lig}_{resid}'
-            cmd.select(f'apo_{apo}', f"({apo} & polymer & ! hydrogen & ! hetatm)")
-            cmd.create(f'apo_{apo}', f'apo_{apo}')
+            apo_polymer_obj = f'apo_{apo_object}'
+            cmd.select(apo_polymer_obj, f"({apo_object} & polymer & ! hydrogen & ! hetatm)")
+            cmd.create(apo_polymer_obj, apo_polymer_obj)
             xyz_base_path = os.path.join(DATA_ROOT, "xyz_files", f"structure_{structureId}")
-            cmd.save(f'{xyz_base_path}/apo_{apo}_{structureId}_{holo_lig}.xyz', f'{holo_lig},apo_{apo}')
+            cmd.save(f'{xyz_base_path}/apo_{apo_object}_{structureId}_{holo_lig}.xyz', f'{holo_lig},{apo_polymer_obj}')
             for lig_cutoff in range(10, 20):
                 if lig_cutoff > 10:
                     cmd.align(apo_selection, holo_selection)
@@ -841,19 +984,19 @@ def pymol_monomer_processing(apo_list: List[str], structureId: str, ligs: List[s
                 try:
                     cmd.align(apo_selection, holo_selection)
                 except Exception:
-                    print(f"Local alignment didn't work AGAIN for apo {apo} and holo {structureId}")
+                    print(f"Local alignment didn't work AGAIN for apo {apo_result_id} and holo {structureId}")
 
-            cmd.select(f'apo_{apo}', f"({apo} & polymer & ! hydrogen & ! hetatm)")
-            cmd.create(f'apo_{apo}', f'apo_{apo}')
+            cmd.select(apo_polymer_obj, f"({apo_object} & polymer & ! hydrogen & ! hetatm)")
+            cmd.create(apo_polymer_obj, apo_polymer_obj)
             xyz_base_path_local = os.path.join(DATA_ROOT, "xyz_files_local", f"structure_{structureId}")
-            cmd.save(f'{xyz_base_path_local}/apo_{apo}_{structureId}_{holo_lig}.xyz', f'{holo_lig},apo_{apo}')
-            filename_apo = f"{xyz_base_path}/apo_{apo}_{structureId}_{holo_lig}.xyz"
+            cmd.save(f'{xyz_base_path_local}/apo_{apo_object}_{structureId}_{holo_lig}.xyz', f'{holo_lig},{apo_polymer_obj}')
+            filename_apo = f"{xyz_base_path}/apo_{apo_object}_{structureId}_{holo_lig}.xyz"
             filename_holo = f"{xyz_base_path}/holo_{structureId}_{holo_lig}.xyz"
-            filename_apo_local = f"{xyz_base_path_local}/apo_{apo}_{structureId}_{holo_lig}.xyz"
+            filename_apo_local = f"{xyz_base_path_local}/apo_{apo_object}_{structureId}_{holo_lig}.xyz"
             filename_holo_local = f"{xyz_base_path_local}/holo_{structureId}_{holo_lig}.xyz"
             resid_name = f'{lig}_{resid}'
             holopdb_chain = structureId
-            apopdb_chain = apo
+            apopdb_chain = apo_object
             try:
                 linear_score_3, segment_scores_3, lig_around_apo_3, lig_around_holo_3 = get_score(
                     xyz_apo=filename_apo,
@@ -917,7 +1060,7 @@ def pymol_monomer_processing(apo_list: List[str], structureId: str, ligs: List[s
             round_rmsd = round(pymolspace[RMSD_name][0], 2)
             result = {
                 'structureId': structureId,
-                'structureId_apo': apo_backup,
+                'structureId_apo': apo_result_id,
                 'ligandId': lig, 
                 'resid': resid,
                 'linear_score_3': linear_score_3,
@@ -944,7 +1087,8 @@ def pymol_monomer_processing(apo_list: List[str], structureId: str, ligs: List[s
                 'lig_around_apo_local_1': lig_around_apo_local_1,
                 'lig_around_holo_local_1': lig_around_holo_local_1,
                 'lig_around_apo_local_3': lig_around_apo_local_3,
-                'lig_around_holo_local_3': lig_around_holo_local_3
+                'lig_around_holo_local_3': lig_around_holo_local_3,
+                'alphafold': alphafold
             }
             holo_apo_score.append(result)
     os.remove(session_path)
@@ -1145,32 +1289,33 @@ def update_combined_from_structures(structure_dir: str, checkpoint_dir: str, com
     if updated_structures:
         new_results = pd.concat(updated_structures, ignore_index=True)
         merge_keys = ['structureId', 'structureId_apo', 'ligandId', 'resid']
+        update_cols = ['linear_score_3', 'linear_score_3_segments', 'rmsd',
+                       'scoreDate', 'linear_score_local_3',
+                       'linear_score_3_segments_local', 'rmsd_local',
+                       'alt_removed_ligand', 'alt_removed_holo', 'alt_removed_apo',
+                       'ligand_contacts', 'holo_full_seq', 'apo_full_seq',
+                       'holo_lig_seq', 'apo_lig_seq', 'linear_score_1',
+                       'linear_score_local_1', 'lig_around_apo_1', 'lig_around_holo_1',
+                       'lig_around_apo_3', 'lig_around_holo_3', 'lig_around_apo_local_1',
+                       'lig_around_holo_local_1', 'lig_around_apo_local_3',
+                       'lig_around_holo_local_3', 'alphafold']
+        available_update_cols = [col for col in update_cols if col in new_results.columns]
         combined = pd.read_pickle(combined_file)
         combined_updated = combined.merge(
-            new_results[merge_keys + ['linear_score_3', 'linear_score_3_segments', 'rmsd',
-                                       'scoreDate', 'linear_score_local_3', 
-                                       'linear_score_3_segments_local', 'rmsd_local',
-                                       'alt_removed_ligand', 'alt_removed_holo', 'alt_removed_apo', 
-                                       'ligand_contacts', 'holo_full_seq', 'apo_full_seq', 
-                                       'holo_lig_seq', 'apo_lig_seq', 'linear_score_1',
-                                       'linear_score_local_1', 'lig_around_apo_1', 'lig_around_holo_1',
-                                       'lig_around_apo_3', 'lig_around_holo_3', 'lig_around_apo_local_1',
-                                       'lig_around_holo_local_1', 'lig_around_apo_local_3', 'lig_around_holo_local_3']],
+            new_results[merge_keys + available_update_cols],
             on=merge_keys,
             how='left',
             suffixes=('', '_new')
         )
-        for col in ['linear_score_3', 'linear_score_3_segments', 'rmsd',
-                    'scoreDate', 'linear_score_local_3', 
-                    'linear_score_3_segments_local', 'rmsd_local',
-                    'alt_removed_ligand', 'alt_removed_holo', 'alt_removed_apo', 
-                    'ligand_contacts', 'holo_full_seq', 'apo_full_seq', 
-                    'holo_lig_seq', 'apo_lig_seq', 'linear_score_1',
-                    'linear_score_local_1', 'lig_around_apo_1', 'lig_around_holo_1',
-                    'lig_around_apo_3', 'lig_around_holo_3', 'lig_around_apo_local_1',
-                    'lig_around_holo_local_1', 'lig_around_apo_local_3', 'lig_around_holo_local_3']:
-            combined_updated[col] = combined_updated[col].combine_first(combined_updated[f"{col}_new"])
-            combined_updated.drop(columns=[f"{col}_new"], inplace=True)
+        for col in available_update_cols:
+            new_col = f"{col}_new"
+            if new_col not in combined_updated.columns:
+                continue
+            if col in combined_updated.columns:
+                combined_updated[col] = combined_updated[col].combine_first(combined_updated[new_col])
+                combined_updated.drop(columns=[new_col], inplace=True)
+            else:
+                combined_updated.rename(columns={new_col: col}, inplace=True)
         combined_updated = combined_updated.drop_duplicates(subset=["structureId", "resid", "ligandId", "structureId_apo"])
         combined_updated.to_pickle(combined_file)
         print(f"Saved updated combined DataFrame with {len(combined_updated)} rows to {combined_file}")
@@ -1218,6 +1363,7 @@ def update_cif_files(combined: pd.DataFrame) -> None:
         return
         
     print(f"Updating {len(files_to_update)} CIF files...")
+    ensure_dir(FETCH_PATH)
     
     # Remove old files
     for structureId in files_to_update:
@@ -1235,7 +1381,7 @@ def update_cif_files(combined: pd.DataFrame) -> None:
                 content = await response.read()
                 with open(output_file, 'wb') as f:
                     f.write(content)
-                print(f"Downloaded: {output_file}")
+                print(f"Downloaded: {os.path.relpath(output_file, start=SCRIPT_DIR)}")
         except Exception as e:
             print(f"Error downloading {pdb_id}: {e}")
             # Try once more after a delay
@@ -1246,7 +1392,7 @@ def update_cif_files(combined: pd.DataFrame) -> None:
                     content = await response.read()
                     with open(output_file, 'wb') as f:
                         f.write(content)
-                    print(f"Downloaded: {output_file}")
+                    print(f"Downloaded: {os.path.relpath(output_file, start=SCRIPT_DIR)}")
             except Exception as e:
                 print(f"Failed to download {pdb_id} after retry: {e}")
     
@@ -1314,13 +1460,15 @@ def main(db_path: str = '.', n_jobs: int = 16, input_list: bool = False,
                            'ligand_contacts', 'holo_full_seq', 'apo_full_seq', 'holo_lig_seq', 'apo_lig_seq',
                            'linear_score_1', 'linear_score_local_1', 'lig_around_apo_1', 'lig_around_holo_1',
                            'lig_around_apo_3', 'lig_around_holo_3', 'lig_around_apo_local_1',
-                           'lig_around_holo_local_1', 'lig_around_apo_local_3', 'lig_around_holo_local_3']
-            old_combined_reduced = old_combined[['structureId', 'resid', 'ligandId', 'structureId_apo'] + update_cols]
+                           'lig_around_holo_local_1', 'lig_around_apo_local_3', 'lig_around_holo_local_3',
+                           'alphafold']
+            available_update_cols = [col for col in update_cols if col in old_combined.columns]
+            old_combined_reduced = old_combined[['structureId', 'resid', 'ligandId', 'structureId_apo'] + available_update_cols]
             merged_combined = pd.merge(new_combined, old_combined_reduced,
                                        on=['structureId', 'resid', 'ligandId', 'structureId_apo'],
                                        how='outer',
                                        suffixes=('', '_old'))
-            for col in update_cols:
+            for col in available_update_cols:
                 merged_combined[col] = merged_combined[col].combine_first(merged_combined[f"{col}_old"])
                 merged_combined.drop(columns=[f"{col}_old"], inplace=True)
             merged_combined.to_pickle(combined_file)

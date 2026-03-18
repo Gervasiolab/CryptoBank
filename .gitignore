@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Notebook metadata
+.ipynb_checkpoints/
+
+# User-provided local input lists
+holo_list.p
+apo_list.p
+
+# Generated helper outputs
+combined.p
+combined_prev.p
+all_sites_df.p
+sites_cluster_*.p
+sasa_output.pkl
+degenerate_ligands.txt
+
+# Structure exports
+*.pse
+*.xyz
+
+# Common pipeline output folders
+data/
+tmp_*/
+run_*/
+smoke_test/
+*/monomer_calcs/
+*/xyz_files/
+*/xyz_files_local/
+*/rejects/

@@ -1,24 +1,31 @@
 import numpy as np
 import pandas as pd
 
-from sklearn.metrics.pairwise import pairwise_distances
-from sklearn.cluster import AgglomerativeClustering
-
-from rdkit import Chem
-from rdkit.Chem import rdFingerprintGenerator
 from rdkit import RDLogger 
-
-from IPython.display import display
 
 from pymol import cmd, util
 
 from joblib import Parallel, delayed
 import os
-import pickle
 
 RDLogger.DisableLog('rdApp.*')
 
-FETCH_PATH = "/home/users/f/febrerma/scratch/cif_files/"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_repo_relative_path(path):
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(SCRIPT_DIR, path))
+
+
+def ensure_dir(directory):
+    os.makedirs(directory, exist_ok=True)
+
+
+FETCH_PATH = resolve_repo_relative_path(os.environ.get("FETCH_PATH", "../../pdb/cif_files"))
+
+
 def create_polymer_selection(holo):
     """
     Create and return the polymer selection name for the holo structure.
@@ -140,10 +147,10 @@ def ligand_properties(holo, resid, resname, index, total_rows):
     """
     if index % 1000 == 0:
         print(f"Processing {index} of {total_rows}")
-    # Fetch the structure; return error if unsuccessful
     try: 
         cmd.reinitialize()
         cmd.feedback("disable", "all", "output")
+        ensure_dir(FETCH_PATH)
         cmd.set('fetch_path', cmd.exp_path(FETCH_PATH), quiet=2)
         cmd.fetch(holo)
     except Exception as e:
@@ -157,7 +164,6 @@ def ligand_properties(holo, resid, resname, index, total_rows):
         df_results['ligandId'] = [resname]
         return df_results
     
-    # Create selections for the polymer and the ligand
     holo_name = create_polymer_selection(holo)
     sel_lig = create_ligand_selection(holo_name, resid, resname)
 
@@ -165,12 +171,10 @@ def ligand_properties(holo, resid, resname, index, total_rows):
         holo_name = create_polymer_selection(holo)
         sel_lig = create_ligand_selection(holo_name, resid, resname)
     
-    cmd.delete(holo)  # Remove the original fetched structure to avoid duplicates
+    cmd.delete(holo)
 
-    # Handle alternate locations for the ligand
     handle_ligand_alternate_locations(sel_lig, resid, resname)
     
-    # Check that the ligand selection is not empty
     if cmd.count_atoms(sel_lig) < 1:
         print(holo, resname, resid, "empty lig selection")
         df_results = pd.DataFrame()
@@ -182,13 +186,10 @@ def ligand_properties(holo, resid, resname, index, total_rows):
         df_results['ligandId'] = [resname]
         return df_results
 
-    # Define the selection for residues within 5 Å of the ligand (i.e., interacting residues)
     sele_res = f"byres {holo_name} & polymer within 4.000 of ({sel_lig})"
     
-    # Handle alternate locations for protein residues
     handle_protein_alternate_locations(holo_name, sele_res, sel_lig, cutoff=4.0)
     
-    # Check that there are interacting residues
     if cmd.count_atoms(sele_res) < 1:
         print(holo, resid, resname,"no prot closed to lig")
         df_results = pd.DataFrame()
@@ -201,16 +202,12 @@ def ligand_properties(holo, resid, resname, index, total_rows):
         return df_results
     
     sele_res_sasa = f"byres {holo_name} & polymer within 5.000 of ({sel_lig})"
-    # Create a named selection for the residues around the ligand
     cmd.select("res_around_lig", sele_res_sasa)
     
-    # Compute the mean SASA for the interacting residues
     mean_sasa = compute_mean_sasa("res_around_lig")
     
-    # Compute ligand properties: number of atoms and molecular weight
     lig_atoms = cmd.count_atoms(sel_lig)
     lig_mw = compute_ligand_mw(sel_lig)
-    #create a dataframe with the results
     df_results = pd.DataFrame()
     df_results['mean_sasa'] = [mean_sasa]
     df_results['lig_atoms'] = [lig_atoms]
@@ -218,7 +215,6 @@ def ligand_properties(holo, resid, resname, index, total_rows):
     df_results['structureId'] = holo
     df_results['resid'] = resid
     df_results['ligandId'] = resname
-    #save the dataframe to a pickle file
     return df_results
 
 
@@ -236,7 +232,6 @@ def load_data(pickle_path):
 
 
 def main():
-    # Define the steps to report progress
     steps = [
         "Loading data",
         "Preparing ligands",
@@ -248,7 +243,6 @@ def main():
     
     print("Starting processing...")
     
-    # Step 1: Load data
     print(f"[1/6] {steps[0]}")
 
     columns_4uniqueligandId = [
@@ -259,17 +253,12 @@ def main():
     pickle_path = "combined.p"
     df_light = load_data(pickle_path)
 
-    #df_light = df[columns_4uniqueligandId]
-    #del df
-
     df_light['clusterNumber95'] = df_light['clusterNumber95'].astype('string')
     df_light['rcsb_id'] = df_light['rcsb_id'].astype('string')
     df_light['ligandId'] = df_light['ligandId'].astype('string')
     df_light['resid'] = df_light['resid'].astype('int')
     df_light['structureId'] = df_light['structureId'].astype('string')
-    #drop duplicated rows in df_light based on the columns 'structureId', 'resid', 'ligandId'
     df_light = df_light.drop_duplicates(subset=['structureId', 'resid', 'ligandId'])
-    #reset the index of df_light
     df_light = df_light.reset_index(drop=True)
     results = Parallel(n_jobs=126)(
         delayed(ligand_properties)(row['structureId'], row['resid'], row['ligandId'], index, len(df_light)) for index, row in df_light.iterrows()
